@@ -334,7 +334,7 @@ class AppController {
     if (targetPanel) {
       targetPanel.classList.add("active");
       this.activeView = viewId;
-      if (viewId === 'leaderboard-view') this.renderLeaderboard();
+     
     }
 
     // 3. Update nav active indicator
