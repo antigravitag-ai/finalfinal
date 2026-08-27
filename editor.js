@@ -1,0 +1,476 @@
+// Python AI - Live Code Editor & Pyodide Python Runtime Engine
+
+class PyodideRunner {
+  constructor() {
+    this.pyodide = null;
+    this.loading = false;
+    this.loaded = false;
+    this.loadError = null;
+  }
+
+  async ensureLoaded() {
+    if (this.loaded && this.pyodide) return true;
+    if (this.loading) {
+      // Wait for existing load to complete
+      while (this.loading) {
+        await new Promise(r => setTimeout(r, 100));
+      }
+      return this.loaded;
+    }
+
+    this.loading = true;
+    try {
+      // Wait for loadPyodide to appear (CDN script is loaded asynchronously)
+      let waitCount = 0;
+      while (typeof loadPyodide === "undefined" && waitCount < 80) {
+        await new Promise(r => setTimeout(r, 100));
+        waitCount++;
+      }
+      if (typeof loadPyodide === "undefined") {
+        throw new Error("Pyodide CDN script not loaded. Check your internet connection.");
+      }
+
+      this.pyodide = await loadPyodide({
+        indexURL: "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/"
+      });
+
+      // Provide a JS-side inline input helper (pyodide_input) that Python can await via `from js import pyodide_input`.
+      // This shows a small input box inside the active console area instead of using window.prompt.
+      window.pyodide_input = function(promptText) {
+        return new Promise(resolve => {
+          try {
+            const consoleId = window.__pynova_active_console_id || 'sandbox-console-log';
+            const consoleEl = document.getElementById(consoleId) || document.body;
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'py-input-wrapper';
+            wrapper.style.marginTop = '8px';
+            wrapper.style.padding = '10px';
+            wrapper.style.borderRadius = '8px';
+            wrapper.style.background = 'linear-gradient(135deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))';
+            wrapper.style.border = '1px solid rgba(255,255,255,0.04)';
+
+            const safePrompt = String(promptText || '');
+            wrapper.innerHTML = `<div style="font-weight:600; color:var(--text-primary); margin-bottom:6px;">${safePrompt}</div><div style="display:flex; gap:8px;"><input class="py-input-field" style="flex:1; padding:8px; border-radius:6px; border:1px solid rgba(255,255,255,0.06); background:transparent; color:var(--text-primary)"></input><button class="py-input-submit btn" style="padding:8px 12px;">Submit</button><button class="py-input-cancel btn" style="padding:8px 12px;">Cancel</button></div>`;
+
+            consoleEl.appendChild(wrapper);
+            const inputField = wrapper.querySelector('.py-input-field');
+            inputField.focus();
+
+            const cleanup = (val) => { try { wrapper.remove(); } catch (e) {} ; resolve(val); };
+            wrapper.querySelector('.py-input-submit').addEventListener('click', () => cleanup(inputField.value));
+            wrapper.querySelector('.py-input-cancel').addEventListener('click', () => cleanup(''));
+            inputField.addEventListener('keydown', (e) => { if (e.key === 'Enter') { cleanup(inputField.value); } });
+          } catch (err) {
+            resolve('');
+          }
+        });
+      };
+
+      this.loaded = true;
+      this.loading = false;
+
+      // Update status indicator if present
+      const statusEl = document.getElementById("pyodide-status");
+      if (statusEl) {
+        statusEl.textContent = "Runtime: Ready ✓";
+        statusEl.style.color = "var(--accent-green)";
+      }
+
+      return true;
+    } catch (err) {
+      this.loadError = err.message || "Failed to load Python runtime.";
+      this.loading = false;
+      this.loaded = false;
+
+      const statusEl = document.getElementById("pyodide-status");
+      if (statusEl) {
+        statusEl.textContent = "Runtime: Error";
+        statusEl.style.color = "var(--accent-red)";
+      }
+
+      return false;
+    }
+  }
+
+  async runCode(code, consoleId) {
+    const isFirstLoad = !this.loaded;
+    let interruptBuffer = null;
+    let timeoutId = null;
+
+    const ok = await this.ensureLoaded();
+    if (!ok) {
+      return {
+        success: false,
+        output: "",
+        errorName: "RuntimeError",
+        errorMessage: this.loadError || "Python runtime could not be loaded. Please check your internet connection and reload the page."
+      };
+    }
+
+    // Set the active console id so inline input attaches to correct area
+    window.__pynova_active_console_id = consoleId || window.__pynova_active_console_id || 'sandbox-console-log';
+
+    try {
+      // Redirect stdout/stderr to a StringIO buffer
+      await this.pyodide.runPythonAsync(`
+import sys, io
+_stdout_buffer = io.StringIO()
+_stderr_buffer = io.StringIO()
+sys.stdout = _stdout_buffer
+sys.stderr = _stderr_buffer
+`);
+
+      // If user code uses input(), transform into an async wrapper that awaits the JS helper
+      let execCode = code;
+      const usesInput = /\binput\s*\(/.test(code);
+      if (usesInput) {
+        const replaced = code.replace(/\binput\s*\(/g, 'await pyodide_input(');
+        const indented = replaced.split('\n').map(line => '    ' + line).join('\n');
+        execCode = `from js import pyodide_input\nimport asyncio\nasync def __pynova_main():\n${indented}\nasyncio.run(__pynova_main())`;
+      }
+
+      // Execute user code with a timeout
+      const timeoutMs = 10000;
+      if (typeof SharedArrayBuffer !== 'undefined' && typeof this.pyodide.setInterruptBuffer === 'function') {
+        interruptBuffer = new Uint8Array(new SharedArrayBuffer(1));
+        this.pyodide.setInterruptBuffer(interruptBuffer);
+      }
+      const execPromise = this.pyodide.runPythonAsync(execCode);
+
+      const result = await Promise.race([
+        execPromise,
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            if (interruptBuffer) interruptBuffer[0] = 2;
+            reject(new Error("TIMEOUT"));
+          }, timeoutMs);
+        })
+      ]);
+      clearTimeout(timeoutId);
+
+      // Capture output
+      const stdout = this.pyodide.runPython(`_stdout_buffer.getvalue()`);
+      const partialErr = this.pyodide.runPython(`_stderr_buffer.getvalue()`);
+
+      // Reset stdout/stderr
+      this.pyodide.runPython(`
+sys.stdout = sys.__stdout__
+sys.stderr = sys.__stderr__
+`);
+
+      const output = stdout + (partialErr ? "\n" + partialErr : "");
+      return {
+        success: true,
+        output: output || "Code ran successfully (no output)."
+      };
+
+    } catch (err) {
+      // Reset stdout/stderr even on error
+      try {
+        if (timeoutId) clearTimeout(timeoutId);
+        if (interruptBuffer) interruptBuffer[0] = 0;
+        const partialOut = this.pyodide.runPython(`_stdout_buffer.getvalue()`);
+        const partialErr = this.pyodide.runPython(`_stderr_buffer.getvalue()`);
+        this.pyodide.runPython(`
+sys.stdout = sys.__stdout__
+sys.stderr = sys.__stderr__
+`);
+
+        if (err.message === "TIMEOUT") {
+          return {
+            success: false,
+            output: [partialOut, partialErr].filter(Boolean).join("\n"),
+            errorName: "TimeoutError",
+            errorMessage: "Execution timed out. The program may contain an infinite loop.",
+            traceback: ""
+          };
+        }
+
+        // Pyodide may write the useful traceback to stderr instead of the wrapper message.
+        const capturedOutput = [partialOut, partialErr].filter(Boolean).join("\n");
+        let errorStr = err.message || String(err);
+
+        // Pyodide wraps Python exceptions - extract the traceback
+        let pyTraceback = "";
+        let errorName = "Error";
+        let errorMessage = errorStr;
+
+        if (capturedOutput.includes("Traceback") || errorStr.includes("Traceback")) {
+          const tracebackSource = capturedOutput.includes("Traceback") ? capturedOutput : errorStr;
+          pyTraceback = tracebackSource.slice(tracebackSource.indexOf("Traceback"));
+          // Extract just the last line (the actual error)
+          const lines = pyTraceback.trim().split("\n");
+          const lastLine = lines[lines.length - 1];
+          const colonIdx = lastLine.indexOf(":");
+          if (colonIdx > 0) {
+            errorName = lastLine.substring(0, colonIdx).trim();
+            errorMessage = lastLine.substring(colonIdx + 1).trim();
+          } else {
+            errorMessage = lastLine;
+          }
+        } else {
+          // Simple error without traceback
+          const colonIdx = errorStr.indexOf(":");
+          if (colonIdx > 0 && colonIdx < 30) {
+            errorName = errorStr.substring(0, colonIdx).trim();
+            errorMessage = errorStr.substring(colonIdx + 1).trim();
+          }
+        }
+
+        return {
+          success: false,
+          output: [partialOut, partialErr].filter(Boolean).join("\n"),
+          errorName,
+          errorMessage,
+          traceback: pyTraceback || partialErr,
+          sourceCode: code
+        };
+
+      } catch (resetErr) {
+        return {
+          success: false,
+          output: "",
+          errorName: "InternalError",
+          errorMessage: "An internal error occurred while handling the Python error: " + (err.message || String(err))
+        };
+      }
+    }
+  }
+}
+// Global Pyodide runner instance
+const pyodideRunner = new PyodideRunner();
+window.PyNovaPyodideRunner = pyodideRunner;
+
+class EditorController {
+  constructor() {
+    this.defaultSandboxCode = `# Python AI - Live Python Editor
+print("Welcome to Python AI Sandbox!")
+
+# Try real Python!
+name = input("What is your name? ")
+print(f"Hello, {name}! Welcome aboard.")
+`;
+    this.initElements();
+    this.bindEvents();
+  }
+
+  initElements() {
+    // Sandbox Elements
+    this.sandboxEditor = document.getElementById("sandbox-code-editor");
+    this.sandboxLineNumbers = document.getElementById("sandbox-line-numbers");
+    this.sandboxConsole = document.getElementById("sandbox-console-log");
+    this.sandboxRunBtn = document.getElementById("sandbox-run-btn");
+    this.sandboxResetBtn = document.getElementById("sandbox-reset-btn");
+    this.sandboxClearBtn = document.getElementById("sandbox-clear-btn");
+
+    // Lesson Elements
+    this.lessonEditor = document.getElementById("lesson-code-editor");
+    this.lessonLineNumbers = document.getElementById("lesson-line-numbers");
+    this.lessonConsole = document.getElementById("lesson-console-output");
+    this.lessonRunBtn = document.getElementById("lesson-run-code-btn");
+    this.lessonResetBtn = document.getElementById("lesson-reset-code-btn");
+
+    // Project Elements
+    this.projectEditor = document.getElementById("project-code-editor");
+    this.projectLineNumbers = document.getElementById("project-line-numbers");
+    this.projectConsole = document.getElementById("project-console-output");
+    this.projectRunBtn = document.getElementById("project-run-btn");
+    this.projectResetBtn = document.getElementById("project-reset-btn");
+  }
+
+  bindEvents() {
+    // Sync line numbers for each editor
+    const editors = [
+      [this.sandboxEditor, this.sandboxLineNumbers],
+      [this.lessonEditor, this.lessonLineNumbers],
+      [this.projectEditor, this.projectLineNumbers]
+    ];
+
+    editors.forEach(([textarea, lineDiv]) => {
+      if (!textarea || !lineDiv) return;
+      textarea.addEventListener("input", () => this.syncLineNumbers(textarea, lineDiv));
+      textarea.addEventListener("scroll", () => this.syncScroll(textarea, lineDiv));
+      textarea.addEventListener("keydown", (e) => this.handleEditorKeys(e, textarea, lineDiv));
+    });
+
+    // Run Code Triggers
+    if (this.sandboxRunBtn) this.sandboxRunBtn.addEventListener("click", () => this.runSandboxCode());
+    if (this.lessonRunBtn) this.lessonRunBtn.addEventListener("click", () => this.runLessonCode());
+    if (this.projectRunBtn) this.projectRunBtn.addEventListener("click", () => this.runProjectCode());
+
+    // Auxiliary Triggers
+    if (this.sandboxClearBtn) {
+      this.sandboxClearBtn.addEventListener("click", () => {
+        this.sandboxEditor.value = "";
+        this.syncLineNumbers(this.sandboxEditor, this.sandboxLineNumbers);
+        this.sandboxConsole.innerText = "> Workspace cleared.";
+        this.sandboxConsole.classList.remove("error");
+      });
+    }
+    if (this.sandboxResetBtn) {
+      this.sandboxResetBtn.addEventListener("click", () => {
+        this.sandboxEditor.value = this.defaultSandboxCode;
+        this.syncLineNumbers(this.sandboxEditor, this.sandboxLineNumbers);
+        this.sandboxConsole.innerText = "> Workspace reset to default.";
+        this.sandboxConsole.classList.remove("error");
+      });
+    }
+  }
+
+  syncLineNumbers(textarea, lineNumbersDiv) {
+    if (!textarea || !lineNumbersDiv) return;
+    const lines = textarea.value.split("\n");
+    let numbers = "";
+    for (let i = 1; i <= lines.length; i++) {
+      numbers += i + "<br>";
+    }
+    lineNumbersDiv.innerHTML = numbers;
+  }
+
+  syncScroll(textarea, lineNumbersDiv) {
+    if (!textarea || !lineNumbersDiv) return;
+    lineNumbersDiv.scrollTop = textarea.scrollTop;
+  }
+
+  handleEditorKeys(e, textarea, lineNumbersDiv) {
+    // Handle Tab Press
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      textarea.value = textarea.value.substring(0, start) + "    " + textarea.value.substring(end);
+      textarea.selectionStart = textarea.selectionEnd = start + 4;
+      this.syncLineNumbers(textarea, lineNumbersDiv);
+    }
+    // Handle Enter Auto-Indentation
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const start = textarea.selectionStart;
+      const text = textarea.value;
+      const beforeCursor = text.substring(0, start);
+      const lines = beforeCursor.split("\n");
+      const currentLine = lines[lines.length - 1];
+
+      const indentMatch = currentLine.match(/^(\s*)/);
+      let indent = indentMatch ? indentMatch[1] : "";
+
+      if (currentLine.trim().endsWith(":")) {
+        indent += "    ";
+      }
+
+      textarea.value = text.substring(0, start) + "\n" + indent + text.substring(textarea.selectionEnd);
+      textarea.selectionStart = textarea.selectionEnd = start + 1 + indent.length;
+      this.syncLineNumbers(textarea, lineNumbersDiv);
+      textarea.scrollTop = textarea.scrollHeight;
+    }
+  }
+
+  // --------------------------------------------------
+  // CODE EXECUTION VIA PYODIDE
+  // --------------------------------------------------
+  async runSandboxCode() {
+    const code = this.sandboxEditor.value;
+    this.sandboxConsole.classList.remove("error");
+
+    if (!pyodideRunner.loaded) {
+      this.sandboxConsole.innerText = "> Loading Python runtime (first time only)...";
+    } else {
+      this.sandboxConsole.innerText = "> Running Python code...";
+    }
+
+    // Disable button during execution
+    this.sandboxRunBtn.disabled = true;
+    this.sandboxRunBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Running...`;
+
+    // Track stats
+    if (window.PyNovaState) {
+      window.PyNovaState.addActivity("Sandbox Execution", "Ran Python code in live sandbox.");
+      window.PyNovaState.awardBadge("badge_code");
+    }
+
+    const result = await pyodideRunner.runCode(code, 'sandbox-console-log');
+
+    this.sandboxRunBtn.disabled = false;
+    this.sandboxRunBtn.innerHTML = `<i class="fa-solid fa-play"></i> Run Code`;
+
+    if (result.success) {
+      this.sandboxConsole.classList.remove("error");
+      this.sandboxConsole.innerText = result.output;
+    } else {
+      this.sandboxConsole.classList.add("error");
+      let errorDisplay = "";
+      if (result.output) errorDisplay += result.output + "\n";
+      if (result.traceback) {
+        errorDisplay += result.traceback;
+      } else {
+        errorDisplay += `${result.errorName}: ${result.errorMessage}`;
+      }
+      this.sandboxConsole.innerText = errorDisplay;
+    }
+  }
+
+  async runLessonCode() {
+    const code = this.lessonEditor.value;
+    this.lessonConsole.classList.remove("error");
+
+    if (!pyodideRunner.loaded) {
+      this.lessonConsole.innerText = "> Loading Python runtime...";
+    } else {
+      this.lessonConsole.innerText = "> Running code challenge check...";
+    }
+
+    const result = await pyodideRunner.runCode(code, 'lesson-console-output');
+
+    if (result.success) {
+      this.lessonConsole.classList.remove("error");
+      this.lessonConsole.innerText = result.output;
+      window.dispatchEvent(new CustomEvent("lesson-code-run", {
+        detail: { code, output: result.output, success: true }
+      }));
+    } else {
+      this.lessonConsole.classList.add("error");
+      const errMsg = result.traceback || `${result.errorName}: ${result.errorMessage}`;
+      this.lessonConsole.innerText = errMsg;
+      window.dispatchEvent(new CustomEvent("lesson-code-run", {
+        detail: { code, error: result.errorMessage, success: false }
+      }));
+    }
+  }
+
+  async runProjectCode() {
+    const code = this.projectEditor.value;
+    this.projectConsole.classList.remove("error");
+
+    if (!pyodideRunner.loaded) {
+      this.projectConsole.innerText = "> Loading Python runtime...";
+    } else {
+      this.projectConsole.innerText = "> Compiling project execution script...";
+    }
+
+    const result = await pyodideRunner.runCode(code, 'project-console-output');
+
+    if (result.success) {
+      this.projectConsole.classList.remove("error");
+      this.projectConsole.innerText = result.output;
+      window.dispatchEvent(new CustomEvent("project-code-run", {
+        detail: { code, output: result.output, success: true }
+      }));
+    } else {
+      this.projectConsole.classList.add("error");
+      const errMsg = result.traceback || `${result.errorName}: ${result.errorMessage}`;
+      this.projectConsole.innerText = errMsg;
+      window.dispatchEvent(new CustomEvent("project-code-run", {
+        detail: { code, error: result.errorMessage, success: false }
+      }));
+    }
+  }
+}
+
+// Instantiate and expose
+window.addEventListener("DOMContentLoaded", () => {
+  window.PyNovaEditor = new EditorController();
+  if (window.PyNovaEditor.sandboxEditor) {
+    window.PyNovaEditor.syncLineNumbers(window.PyNovaEditor.sandboxEditor, window.PyNovaEditor.sandboxLineNumbers);
+  }
+});

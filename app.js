@@ -1,0 +1,1818 @@
+// PyNova AI - Core Controller & SPA Coordinator
+
+class AppController {
+  constructor() {
+    this.activeView = "dashboard-view";
+    this.activeLesson = null;
+    this.activeQuiz = null;
+    this.activeProject = null;
+    this.activeChatId = "chat_welcome";
+    this.leaderboardChannel = null;
+    
+    this.init();
+  }
+
+  init() {
+    this.initElements();
+    this.bindEvents();
+    this.bindAuthUi();
+    this.syncAuthState();
+  }
+
+  async syncAuthState() {
+    const authShell = document.getElementById('auth-shell');
+    const authLoading = document.getElementById('auth-loading');
+    const appContainer = document.getElementById('app-container');
+    const loadingMessage = document.getElementById('auth-loading-message');
+    const loadingError = document.getElementById('auth-loading-error');
+    const targetHash = (window.location.hash || '#account').replace('#', '');
+
+    if (authLoading) {
+      authLoading.classList.remove('hidden');
+      authLoading.classList.add('visible');
+    }
+    if (authShell) {
+      authShell.classList.add('hidden');
+      authShell.classList.remove('visible');
+    }
+    if (appContainer) {
+      appContainer.classList.add('hidden');
+      appContainer.classList.remove('visible');
+    }
+    if (loadingMessage) {
+      loadingMessage.textContent = 'Checking your secure session…';
+    }
+    if (loadingError) {
+      loadingError.textContent = '';
+      loadingError.classList.add('hidden');
+    }
+
+    try {
+      if (window.PyNovaAuth && typeof window.PyNovaAuth.initialize === 'function') {
+        await window.PyNovaAuth.initialize();
+      }
+
+      const user = window.PyNovaAuth && typeof window.PyNovaAuth.getCurrentUser === 'function'
+        ? await window.PyNovaAuth.getCurrentUser()
+        : null;
+      const isAuthenticated = !!user;
+
+      if (authLoading) {
+        authLoading.classList.add('hidden');
+        authLoading.classList.remove('visible');
+      }
+
+      if (!isAuthenticated) {
+        this.teardownLeaderboardRealtime();
+        if (authShell) {
+          authShell.classList.remove('hidden');
+          authShell.classList.add('visible');
+        }
+        if (appContainer) {
+          appContainer.classList.add('hidden');
+          appContainer.classList.remove('visible');
+        }
+        if (targetHash && !['account', 'register'].includes(targetHash)) {
+          window.location.hash = 'account';
+        }
+        if (this.setAuthMode) {
+          this.setAuthMode(targetHash === 'register' ? 'register' : 'login');
+        }
+        document.querySelectorAll('.view-panel').forEach(panel => panel.classList.remove('active'));
+        this.activeView = null;
+        return false;
+      }
+
+      if (authShell) {
+        authShell.classList.add('hidden');
+        authShell.classList.remove('visible');
+      }
+      if (appContainer) {
+        appContainer.classList.remove('hidden');
+        appContainer.classList.add('visible');
+      }
+
+      if (!targetHash || targetHash === 'account' || targetHash === 'register') {
+        window.location.hash = 'dashboard';
+      }
+
+      if (window.PyNovaState && typeof window.PyNovaState.refreshFromSupabase === 'function') {
+        await window.PyNovaState.refreshFromSupabase();
+      }
+
+      this.loadStateAndStats();
+      if (!window.PyNovaState.state.skillAssessmentCompleted) {
+        this.showSkillAssessment();
+      }
+
+      this.switchView('dashboard-view');
+      this.renderRoadmap();
+      this.renderDashboardRecommendations();
+      this.renderDashboardActivity();
+      this.renderWeeklyChart();
+      this.renderChatSessions();
+      this.renderPracticeArena();
+      this.renderQuizList();
+      // Project Lab removed from UI — do not render projects list
+      // this.renderProjectList();
+      this.renderLeaderboard();
+      this.setupLeaderboardRealtime();
+      this.renderProfile();
+      return true;
+    } catch (error) {
+      console.error('Auth initialization failed', error);
+      if (loadingMessage) {
+        loadingMessage.textContent = 'Secure session check failed';
+      }
+      if (loadingError) {
+        loadingError.textContent = 'Unable to verify your session right now. Please refresh or try again.';
+        loadingError.classList.remove('hidden');
+      }
+      if (authShell) {
+        authShell.classList.remove('hidden');
+        authShell.classList.add('visible');
+      }
+      if (this.setAuthMode) {
+        this.setAuthMode('login');
+      }
+      return false;
+    }
+  }
+
+  initElements() {
+    this.sidebar = document.getElementById("app-sidebar");
+    this.sidebarToggle = document.getElementById("sidebar-toggle");
+    this.navLinks = document.querySelectorAll(".nav-menu .nav-item");
+    this.themeToggle = document.getElementById("theme-toggle-btn");
+    
+    // Header Stats
+    this.hdrXp = document.getElementById("header-xp");
+    this.hdrStreak = document.getElementById("header-streak");
+    this.hdrLevel = document.getElementById("header-level");
+    this.hdrTitle = document.querySelector(".top-header h2");
+  }
+
+  bindEvents() {
+    window.addEventListener('pynova-auth-state-changed', () => this.syncAuthState());
+    window.addEventListener('hashchange', () => this.syncAuthState());
+    window.addEventListener('pynova-profile-updated', () => {
+      if (this.activeView === 'leaderboard-view') this.renderLeaderboard();
+    });
+
+    // Theme toggle
+    if (this.themeToggle) this.themeToggle.addEventListener("click", () => this.toggleTheme());
+
+    // Mobile Sidebar toggle
+    if (this.sidebarToggle) this.sidebarToggle.addEventListener("click", () => {
+      this.sidebar.classList.toggle("mobile-open");
+      const isOpen = this.sidebar.classList.contains("mobile-open");
+      this.sidebarToggle.setAttribute("aria-expanded", String(isOpen));
+      this.sidebarToggle.setAttribute("aria-label", isOpen ? "Close navigation" : "Open navigation");
+    });
+
+    // Navigation triggers
+    this.navLinks.forEach(link => {
+      link.addEventListener("click", (e) => {
+        e.preventDefault();
+        const target = link.getAttribute("data-target");
+        this.switchView(target);
+        this.sidebar.classList.remove("mobile-open");
+        if (this.sidebarToggle) {
+          this.sidebarToggle.setAttribute("aria-expanded", "false");
+          this.sidebarToggle.setAttribute("aria-label", "Open navigation");
+        }
+      });
+    });
+
+    // Hero dashboard buttons
+    document.getElementById("hero-learn-btn").addEventListener("click", () => this.switchView("roadmap-view"));
+    document.getElementById("hero-teacher-btn").addEventListener("click", () => this.switchView("teacher-view"));
+    document.getElementById("continue-lesson-btn").addEventListener("click", () => this.resumeLastLesson());
+
+    // Global Event Listeners
+    window.addEventListener("pynova-level-up", (e) => this.triggerLevelUpModal(e.detail.level));
+    window.addEventListener("pynova-badge-earned", (e) => this.triggerBadgeModal(e.detail.badgeId));
+
+    // Listeners from editor components
+    window.addEventListener("lesson-code-run", (e) => this.checkLessonChallengeCode(e.detail));
+    window.addEventListener("project-code-run", (e) => this.checkProjectChallengeCode(e.detail));
+
+    // Skill Assessment
+    document.getElementById("assessment-next-btn").addEventListener("click", () => this.handleAssessmentNext());
+
+    // Profile resets
+    document.getElementById("profile-reset-state-btn").addEventListener("click", () => this.resetAppState());
+    document.getElementById("profile-avatar-large").addEventListener("click", () => this.changeUserAvatar());
+
+    // Teacher events
+    document.getElementById("chat-send-btn").addEventListener("click", () => this.sendChatMessage());
+    document.getElementById("chat-input-box").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") this.sendChatMessage();
+    });
+    document.getElementById("new-chat-btn").addEventListener("click", () => {
+      const newId = window.PyNovaState.createNewChat();
+      this.activeChatId = newId;
+      this.renderChatMessages();
+      this.renderChatSessions();
+    });
+
+    // Quick Action prompts
+    document.querySelectorAll(".quick-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const text = btn.getAttribute("data-prompt");
+        this.submitTeacherPrompt(text);
+      });
+    });
+
+    // Debug analysis button hooks (only if AI Editor Assistant panel is present)
+    const aiExplainBtn = document.getElementById("ai-tool-explain");
+    if (aiExplainBtn) aiExplainBtn.addEventListener("click", () => this.runSandboxAiTool("explain"));
+    const aiDebugBtn = document.getElementById("ai-tool-debug");
+    if (aiDebugBtn) aiDebugBtn.addEventListener("click", () => this.runSandboxAiTool("debug"));
+    const aiOptimizeBtn = document.getElementById("ai-tool-optimize");
+    if (aiOptimizeBtn) aiOptimizeBtn.addEventListener("click", () => this.runSandboxAiTool("optimize"));
+    const aiTestsBtn = document.getElementById("ai-tool-tests");
+    if (aiTestsBtn) aiTestsBtn.addEventListener("click", () => this.runSandboxAiTool("tests"));
+
+    // Project workspace elements — only attach if the project UI exists (Project Lab removed from nav)
+    const projectBackBtn = document.getElementById("project-back-btn");
+    if (projectBackBtn) {
+      projectBackBtn.addEventListener("click", () => {
+        const workspace = document.getElementById("project-workspace");
+        const listGrid = document.getElementById("project-list-grid");
+        if (workspace) workspace.style.display = "none";
+        if (listGrid) listGrid.style.display = "grid";
+      });
+    }
+    const projectSubmitBtn = document.getElementById("project-submit-btn");
+    if (projectSubmitBtn) projectSubmitBtn.addEventListener("click", () => this.submitProject());
+    const projectMentorSend = document.getElementById("project-mentor-send");
+    if (projectMentorSend) projectMentorSend.addEventListener("click", () => this.sendProjectMentorMessage());
+    const projectMentorInput = document.getElementById("project-mentor-input");
+    if (projectMentorInput) projectMentorInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") this.sendProjectMentorMessage();
+    });
+
+    // Leaderboard settings toggle
+    const leaderToggle = document.getElementById("leaderboard-toggle");
+    if (leaderToggle) leaderToggle.addEventListener("click", () => {
+      const current = window.PyNovaState.state.settings.leaderboardEnabled;
+      window.PyNovaState.state.settings.leaderboardEnabled = !current;
+      window.PyNovaState.save();
+      
+      leaderToggle.innerText = !current ? "Enabled" : "Disabled";
+      leaderToggle.classList.toggle("active", !current);
+      document.getElementById("leaderboard-list-container").style.display = !current ? "block" : "none";
+    });
+  }
+
+  loadStateAndStats() {
+    const state = window.PyNovaState.state;
+    if (this.hdrXp) this.hdrXp.innerText = `${state.profile.xp} XP`;
+    if (this.hdrStreak) this.hdrStreak.innerText = `${state.profile.streak} ${state.profile.streak === 1 ? 'Day' : 'Days'}`;
+    if (this.hdrLevel) this.hdrLevel.innerText = `Lvl ${state.profile.level}`;
+    
+    // Sidebar
+    const sidebarUser = document.getElementById("sidebar-username");
+    const sidebarSubtitle = document.getElementById("sidebar-subtitle");
+    const sidebarAvatar = document.getElementById("sidebar-avatar");
+    const xpCompact = document.getElementById("sidebar-xp-compact");
+    const streakCompact = document.getElementById("sidebar-streak-compact");
+
+    if (sidebarUser) sidebarUser.innerText = state.profile.username;
+    if (sidebarSubtitle) sidebarSubtitle.innerText = `Level ${state.profile.level} • Pythonist`;
+    // Keep the sidebar avatar as the graduation cap SVG by default. If profile.avatar stores a URL or SVG content, render it.
+    if (sidebarAvatar && state.profile.avatar) {
+      const a = String(state.profile.avatar).trim();
+      if (a.startsWith('<svg') || a.startsWith('http') || a.startsWith('<')) {
+        try { sidebarAvatar.innerHTML = state.profile.avatar; } catch(e) { /* ignore */ }
+      } // otherwise keep the static SVG badge
+    }
+
+    // XP / Progress
+    const prog = window.PyNovaState.getXpProgress();
+    const fg = document.getElementById('sidebar-progress-fg');
+    const percentText = document.getElementById('sidebar-progress-percent');
+    const progressWrap = document.querySelector('.progress-bar-wrap');
+    const pct = Math.round(prog.percentage);
+    if (fg) {
+      fg.style.width = `${pct}%`;
+    }
+    if (percentText) percentText.innerText = `${pct}%`;
+    if (progressWrap) progressWrap.setAttribute('aria-valuenow', pct);
+    if (xpCompact) xpCompact.innerText = `${state.profile.xp} XP`;
+    if (streakCompact) streakCompact.innerText = `${state.profile.streak} ${state.profile.streak === 1 ? 'Day' : 'Days'}`;
+
+    // Dark/Light theme class on body
+    if (state.settings.theme === "light") {
+      document.body.classList.add("light-mode");
+      this.themeToggle.innerHTML = `<i class="fa-solid fa-sun"></i>`;
+    } else {
+      document.body.classList.remove("light-mode");
+      this.themeToggle.innerHTML = `<i class="fa-solid fa-moon"></i>`;
+    }
+
+    // Set Continue Learning lesson title
+    const nextNode = this.determineNextRoadmapNode();
+    document.getElementById("continue-lesson-title").innerText = this.formatId(nextNode);
+  }
+
+  toggleTheme() {
+    const isLight = document.body.classList.toggle("light-mode");
+    window.PyNovaState.state.settings.theme = isLight ? "light" : "dark";
+    window.PyNovaState.save();
+    this.themeToggle.innerHTML = isLight ? `<i class="fa-solid fa-sun"></i>` : `<i class="fa-solid fa-moon"></i>`;
+  }
+
+  switchView(viewId) {
+    // 1. Hide active panel
+    document.querySelectorAll(".view-panel").forEach(panel => {
+      panel.classList.remove("active");
+    });
+    // 2. Select matching panel
+    const targetPanel = document.getElementById(viewId);
+    if (targetPanel) {
+      targetPanel.classList.add("active");
+      this.activeView = viewId;
+      if (viewId === 'leaderboard-view') this.renderLeaderboard();
+    }
+
+    // 3. Update nav active indicator
+    if (this.navLinks) {
+      this.navLinks.forEach(link => {
+        link.classList.remove("active");
+        if (link.getAttribute("data-target") === viewId) {
+          link.classList.add("active");
+        }
+      });
+    }
+
+    // 4. Update Header Title
+    if (this.hdrTitle) {
+      const viewName = viewId.replace("-view", "").replace(/^\w/, c => c.toUpperCase());
+      const cleanViewName = viewName === 'Dashboard' ? 'Core' : viewName;
+      const titleMap = {
+        'Quiz': 'Quiz Center',
+        'Practice': 'Practice Arena',
+        'Roadmap': 'Roadmap',
+        'Teacher': 'AI Teacher',
+        'Debugger': 'AI Debug Lab',
+        'Leaderboard': 'Leaderboard',
+        'Profile': 'Profile'
+      };
+      const label = titleMap[viewName] || cleanViewName;
+      this.hdrTitle.innerText = viewId === 'quiz-view' ? 'Quiz Center' : `Python AI ${label === 'Core' ? 'Core' : label}`;
+
+      // Hide the pyodide/runtime status bar when viewing the Quiz Center to remove extra chrome
+      const pyStatus = document.getElementById('pyodide-status');
+      if (pyStatus) {
+        pyStatus.style.display = viewId === 'quiz-view' ? 'none' : 'inline-block';
+      }
+    }
+
+    // Reload stats updates
+    this.loadStateAndStats();
+    
+    // Specific updates
+    if (viewId === "dashboard-view") {
+      this.renderDashboardRecommendations();
+      this.renderDashboardActivity();
+    } else if (viewId === "roadmap-view") {
+      this.renderRoadmap();
+    } else if (viewId === "profile-view") {
+      this.renderProfile();
+    } else if (viewId === "leaderboard-view") {
+      this.renderLeaderboard();
+    }
+  }
+
+  bindAuthUi() {
+    const loginForm = document.getElementById('login-form');
+    const registerForm = document.getElementById('register-form');
+    const showRegisterBtn = document.getElementById('show-register-btn');
+    const showLoginBtn = document.getElementById('show-login-btn');
+    const loginPanel = document.getElementById('auth-login-panel');
+    const registerPanel = document.getElementById('auth-register-panel');
+    const loginError = document.getElementById('login-error');
+    const registerError = document.getElementById('register-error');
+    const profileLogoutBtn = document.getElementById('profile-logout-btn');
+
+    const showLogin = () => {
+      if (loginPanel) {
+        loginPanel.classList.remove('hidden');
+        loginPanel.hidden = false;
+      }
+      if (registerPanel) {
+        registerPanel.classList.add('hidden');
+        registerPanel.hidden = true;
+      }
+      if (loginError) loginError.textContent = '';
+      if (registerError) registerError.textContent = '';
+      if (window.location.hash !== '#register') {
+        window.location.hash = 'account';
+      }
+    };
+
+    const showRegister = () => {
+      if (loginPanel) {
+        loginPanel.classList.add('hidden');
+        loginPanel.hidden = true;
+      }
+      if (registerPanel) {
+        registerPanel.classList.remove('hidden');
+        registerPanel.hidden = false;
+      }
+      if (loginError) loginError.textContent = '';
+      if (registerError) registerError.textContent = '';
+      window.location.hash = 'register';
+    };
+
+    this.setAuthMode = (mode) => {
+      if (mode === 'register') {
+        showRegister();
+      } else {
+        showLogin();
+      }
+    };
+
+    if (showRegisterBtn) showRegisterBtn.addEventListener('click', showRegister);
+    if (showLoginBtn) showLoginBtn.addEventListener('click', showLogin);
+
+    if (loginForm) {
+      loginForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (loginError) loginError.textContent = '';
+        const username = document.getElementById('login-username').value;
+        const password = document.getElementById('login-password').value;
+        const result = await window.PyNovaAuth.signIn(username, password);
+        if (!result.ok) {
+          loginError.textContent = result.error;
+          return;
+        }
+        this.syncAuthState();
+      });
+    }
+
+    if (registerForm) {
+      registerForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (registerError) registerError.textContent = '';
+        const username = document.getElementById('register-username').value;
+        const password = document.getElementById('register-password').value;
+        const confirmPassword = document.getElementById('register-confirm-password').value;
+        const result = await window.PyNovaAuth.register(username, password, confirmPassword);
+        if (!result.ok) {
+          registerError.textContent = result.error;
+          return;
+        }
+        this.syncAuthState();
+      });
+    }
+
+    if (profileLogoutBtn) {
+      profileLogoutBtn.addEventListener('click', async () => {
+        if (window.PyNovaAuth && typeof window.PyNovaAuth.logout === 'function') {
+          await window.PyNovaAuth.logout();
+        }
+        window.location.hash = '#account';
+        this.syncAuthState();
+      });
+    }
+  }
+
+  // ----------------------------------------------------
+  // LANDING & RECOMMENDATIONS ENGINE
+  // ----------------------------------------------------
+  determineNextRoadmapNode() {
+    const state = window.PyNovaState.state;
+    // Iterate through DB lessons in order, pick first uncompleted
+    for (const lvl of window.PyNovaDb.ROADMAP) {
+      for (const lesson of lvl.lessons) {
+        if (!state.progress.lessons[lesson.id]) {
+          return lesson.id;
+        }
+      }
+    }
+    return "intro_to_python"; // Fallback to start
+  }
+
+  resumeLastLesson() {
+    const nextNode = this.determineNextRoadmapNode();
+    this.launchLesson(nextNode);
+  }
+
+  renderDashboardRecommendations() {
+    const container = document.getElementById("ai-recommendations-container");
+    if (!container) return;
+
+    const state = window.PyNovaState.state;
+    container.innerHTML = "";
+
+    // 1. Check for weak topics first
+    if (state.weakTopics.length > 0) {
+      const topic = state.weakTopics[0];
+      const recDiv = document.createElement("div");
+      recDiv.className = "continue-widget";
+      recDiv.style.border = "1px solid var(--accent-red)";
+      recDiv.style.background = "rgba(239, 68, 68, 0.03)";
+      recDiv.innerHTML = `
+        <div class="lesson-node-icon" style="border-color: var(--accent-red); color: var(--accent-red); box-shadow: none;"><i class="fa-solid fa-circle-exclamation"></i></div>
+        <div class="continue-details">
+          <h4 class="continue-title" style="color: var(--accent-red)">Reinforce: ${this.formatId(topic)}</h4>
+          <div class="continue-desc">Let's review this concept in detail.</div>
+        </div>
+        <button class="btn btn-secondary" id="rec-topic-btn" style="padding: 8px 16px;">Practice Now</button>
+      `;
+      container.appendChild(recDiv);
+      
+      // Bind click
+      recDiv.querySelector("button").addEventListener("click", () => {
+        this.submitTeacherPrompt(`Let's practice ${topic} again.`);
+        this.switchView("teacher-view");
+      });
+    }
+
+    // 2. Recommend next lesson node card
+    const nextNode = this.determineNextRoadmapNode();
+    const nextCard = document.createElement("div");
+    nextCard.className = "continue-widget";
+    nextCard.innerHTML = `
+      <div class="lesson-node-icon"><i class="fa-solid fa-sparkles"></i></div>
+      <div class="continue-details">
+        <h4 class="continue-title">Study Target: ${this.formatId(nextNode)}</h4>
+        <div class="continue-desc">Python AI recommends focusing on this foundations concept.</div>
+      </div>
+      <button class="btn btn-primary" style="padding: 8px 16px;">Study</button>
+    `;
+    container.appendChild(nextCard);
+    nextCard.querySelector("button").addEventListener("click", () => {
+      this.launchLesson(nextNode);
+    });
+  }
+
+  renderDashboardActivity() {
+    const log = document.getElementById("activity-log-container");
+    if (!log) return;
+    
+    log.innerHTML = "";
+    const activities = window.PyNovaState.state.activity;
+    
+    if (activities.length === 0) {
+      log.innerHTML = `<li class="activity-item">No recent activity detected.</li>`;
+      return;
+    }
+
+    activities.forEach(act => {
+      const li = document.createElement("li");
+      li.className = "activity-item";
+      li.innerHTML = `
+        <div class="activity-info">
+          <span class="activity-type">${act.type}</span>
+          <span class="activity-detail">${act.detail}</span>
+        </div>
+        <span class="activity-date">${act.date}</span>
+      `;
+      log.appendChild(li);
+    });
+
+    // Populate Weak Topics list
+    const weakBox = document.getElementById("weak-topics-container");
+    weakBox.innerHTML = "";
+    const weakList = window.PyNovaState.state.weakTopics;
+    
+    if (weakList.length === 0) {
+      weakBox.innerHTML = `<span class="topic-tag recommend"><i class="fa-solid fa-face-smile"></i> Standard mastery is great!</span>`;
+    } else {
+      weakList.forEach(topic => {
+        const tag = document.createElement("span");
+        tag.className = "topic-tag weak";
+        tag.innerHTML = `<i class="fa-solid fa-circle-exclamation"></i> ${this.formatId(topic)}`;
+        weakBox.appendChild(tag);
+      });
+    }
+  }
+
+  renderWeeklyChart() {
+    const chart = document.getElementById("xp-weekly-chart");
+    if (!chart) return;
+
+    chart.innerHTML = "";
+    const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const baseHeights = [20, 45, 10, 80, 50, 95, 30]; // Mock weekly XP heights values
+    
+    days.forEach((day, idx) => {
+      const bar = document.createElement("div");
+      bar.className = "chart-bar";
+      bar.style.height = `${baseHeights[idx]}%`;
+      bar.innerHTML = `
+        <span class="chart-bar-value">${baseHeights[idx] * 5} XP</span>
+        <span class="chart-label">${day}</span>
+      `;
+      chart.appendChild(bar);
+    });
+  }
+
+  // ----------------------------------------------------
+  // SURVEY / INITIAL ASSESSMENT
+  // ----------------------------------------------------
+  showSkillAssessment() {
+    const modal = document.getElementById("assessment-modal");
+    modal.classList.add("active");
+    this.assessmentIdx = 0;
+    this.renderAssessmentQuestion();
+  }
+
+  renderAssessmentQuestion() {
+    const container = document.getElementById("assessment-question-container");
+    const item = window.PyNovaDb.SKILL_ASSESSMENT[this.assessmentIdx];
+    
+    let optionsHtml = "";
+    item.options.forEach((opt, idx) => {
+      optionsHtml += `
+        <button class="quiz-option" data-idx="${idx}" style="width: 100%; margin-bottom: 8px;">
+          ${opt}
+        </button>
+      `;
+    });
+
+    container.innerHTML = `
+      <div style="font-weight: 600; font-size: 15px; margin-bottom: 14px;">Q${this.assessmentIdx + 1}: ${item.question}</div>
+      <div class="quiz-options-list">${optionsHtml}</div>
+    `;
+
+    // Bind option click
+    container.querySelectorAll(".quiz-option").forEach(btn => {
+      btn.addEventListener("click", () => {
+        container.querySelectorAll(".quiz-option").forEach(b => b.classList.remove("active", "correct"));
+        btn.classList.add("correct");
+        this.selectedAssessmentIdx = parseInt(btn.getAttribute("data-idx"));
+      });
+    });
+  }
+
+  handleAssessmentNext() {
+    if (this.selectedAssessmentIdx === undefined) {
+      alert("Please select an option to customize your profile.");
+      return;
+    }
+
+    this.selectedAssessmentIdx = undefined;
+    this.assessmentIdx += 1;
+
+    if (this.assessmentIdx < window.PyNovaDb.SKILL_ASSESSMENT.length) {
+      this.renderAssessmentQuestion();
+    } else {
+      // Completed
+      document.getElementById("assessment-modal").classList.remove("active");
+      window.PyNovaState.state.skillAssessmentCompleted = true;
+      
+      // Award starting bonus XP
+      window.PyNovaState.addActivity("Assessment Completed", "Completed profile assessment checks!");
+      window.PyNovaState.addXp(100); 
+      
+      this.loadStateAndStats();
+      this.renderDashboardRecommendations();
+    }
+  }
+
+  // ----------------------------------------------------
+  // ROADMAP GENERATOR
+  // ----------------------------------------------------
+  renderRoadmap() {
+    const tree = document.getElementById("roadmap-tree");
+    if (!tree) return;
+
+    tree.innerHTML = "";
+    const state = window.PyNovaState.state;
+
+    // Tracks if we locked subsequent node
+    let unlockNext = true;
+
+    window.PyNovaDb.ROADMAP.forEach(lvl => {
+      const lvlBlock = document.createElement("div");
+      lvlBlock.className = "roadmap-level-block";
+      
+      let nodesHtml = "";
+      lvl.lessons.forEach(lesson => {
+        const isCompleted = state.progress.lessons[lesson.id] === true;
+        const isActive = !isCompleted && unlockNext;
+        const isLocked = !isCompleted && !isActive;
+
+        let statusClass = "locked";
+        let statusIcon = `<i class="fa-solid fa-lock"></i>`;
+        
+        if (isCompleted) {
+          statusClass = "completed";
+          statusIcon = `<i class="fa-solid fa-check"></i>`;
+        } else if (isActive) {
+          statusClass = "active";
+          statusIcon = `<i class="fa-solid fa-spinner fa-spin"></i>`;
+          unlockNext = false; // Rest are locked
+        }
+
+        nodesHtml += `
+          <div class="roadmap-node ${statusClass}" data-lesson-id="${lesson.id}">
+            <i class="fa-brands fa-python"></i>
+            <div class="roadmap-node-status">${statusIcon}</div>
+            
+            <div class="node-tooltip">
+              <div class="node-tooltip-title">${lesson.title}</div>
+              <div class="node-tooltip-xp">${lesson.xpReward} XP Reward</div>
+            </div>
+          </div>
+        `;
+      });
+
+      lvlBlock.innerHTML = `
+        <div class="level-header-title" style="color: ${lvl.color}">Level ${lvl.level} — ${lvl.name}</div>
+        <div class="roadmap-nodes-container">
+          <div class="roadmap-node-connector"></div>
+          ${nodesHtml}
+        </div>
+      `;
+
+      tree.appendChild(lvlBlock);
+
+      // Bind node clicks
+      lvlBlock.querySelectorAll(".roadmap-node").forEach(node => {
+        node.addEventListener("click", () => {
+          const lessonId = node.getAttribute("data-lesson-id");
+          if (node.classList.contains("locked")) {
+            alert("This lesson is currently locked! Complete preceding roadmap target nodes to unlock.");
+            return;
+          }
+          this.launchLesson(lessonId);
+        });
+      });
+    });
+  }
+
+  // ----------------------------------------------------
+  // INTERACTIVE LESSONS VIEW
+  // ----------------------------------------------------
+  launchLesson(lessonId) {
+    // Locate lesson
+    let matchedLesson = null;
+    for (const lvl of window.PyNovaDb.ROADMAP) {
+      const match = lvl.lessons.find(l => l.id === lessonId);
+      if (match) {
+        matchedLesson = match;
+        break;
+      }
+    }
+
+    if (!matchedLesson) return;
+    this.activeLesson = matchedLesson;
+    this.switchView("lessons-view");
+
+    // Populate Left Study Content
+    const details = document.getElementById("lesson-details-panel");
+    details.innerHTML = `
+      <h2 style="font-size: 24px; display: flex; align-items: center; gap: 8px;">
+        <i class="fa-brands fa-python" style="color: var(--accent-violet)"></i> ${matchedLesson.title}
+      </h2>
+      <div style="font-size: 13px; color: var(--accent-cyan); font-weight: 600;">Foundations Node • +${matchedLesson.xpReward} XP</div>
+      
+      <div class="lesson-explanation">${matchedLesson.explanation}</div>
+      
+      <h4 style="font-size: 14px; text-transform: uppercase; color: var(--text-muted); margin-top: 10px;">Visual Sandbox Concept</h4>
+      ${matchedLesson.visualConcept}
+
+      <h4 style="font-size: 14px; text-transform: uppercase; color: var(--text-muted); margin-top: 10px;">Code Example</h4>
+      <div style="background-color: rgb(5,5,10); border: 1px solid var(--border-color); border-radius: 12px; padding: 14px; position: relative;">
+        <pre><code style="color: #a8ff60">${matchedLesson.codeExample}</code></pre>
+        <button class="editor-btn" id="lesson-copy-code-btn" style="position: absolute; right: 12px; top: 12px; font-size: 11px;">Copy to Editor</button>
+      </div>
+
+      <div class="real-world-box">
+        <div class="real-world-title">Real World Application</div>
+        <div style="font-size: 13px; color: var(--text-secondary); line-height: 1.5;">${matchedLesson.realWorldExample}</div>
+      </div>
+
+      <div class="mistake-box">
+        <div class="mistake-title">Common Mistakes</div>
+        <ul style="list-style-type: none; padding: 0; font-size: 13px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 8px;">
+          ${matchedLesson.commonMistakes.map(m => `<li>⚠️ <strong>${m.mistake}:</strong> ${m.explanation}</li>`).join("")}
+        </ul>
+      </div>
+    `;
+
+    // Bind copying code to editor
+    document.getElementById("lesson-copy-code-btn").addEventListener("click", () => {
+      document.getElementById("lesson-code-editor").value = matchedLesson.codeExample;
+      window.PyNovaEditor.syncLineNumbers(window.PyNovaEditor.lessonEditor, window.PyNovaEditor.lessonLineNumbers);
+    });
+
+    // Populate Right Interactive elements: Quiz
+    const quizBox = document.getElementById("lesson-quiz-container");
+    const quizData = matchedLesson.quiz;
+    this.lessonQuizQuestions = Array.isArray(quizData.questions) && quizData.questions.length
+      ? quizData.questions
+      : [quizData];
+    this.lessonQuizIndex = 0;
+    this.lessonQuizState = 'QUESTION_ACTIVE';
+
+    quizBox.innerHTML = `
+      <h3 style="font-size: 16px; margin-bottom: 8px;"><i class="fa-solid fa-circle-question" style="color: var(--accent-cyan)"></i> Concept Quick Check</h3>
+      <p class="lesson-quiz-question" style="font-size: 14px; color: var(--text-secondary); margin-bottom: 12px;"></p>
+      <div class="quiz-options-list"></div>
+      <div id="lesson-quiz-explanation" style="margin-top: 12px; font-size: 13px; display: none; padding: 10px; border-radius: 8px;"></div>
+      <button class="btn btn-primary lesson-next-question" id="lesson-next-question-btn" type="button" disabled>Next Question →</button>
+    `;
+
+    const renderQuizQuestion = () => {
+      const question = this.lessonQuizQuestions[this.lessonQuizIndex];
+      const questionText = quizBox.querySelector('.lesson-quiz-question');
+      const options = quizBox.querySelector('.quiz-options-list');
+      const explanation = document.getElementById('lesson-quiz-explanation');
+      const nextButton = document.getElementById('lesson-next-question-btn');
+      questionText.textContent = question.question;
+      options.innerHTML = question.options.map((option, index) => `<button class="quiz-option" data-idx="${index}" type="button">${option}</button>`).join('');
+      explanation.style.display = 'none';
+      explanation.innerHTML = '';
+      explanation.className = '';
+      nextButton.disabled = true;
+      nextButton.textContent = this.lessonQuizIndex === this.lessonQuizQuestions.length - 1 ? 'Finish Quiz' : 'Next Question →';
+      this.lessonQuizState = 'QUESTION_ACTIVE';
+
+      options.querySelectorAll('.quiz-option').forEach(button => {
+        button.addEventListener('click', () => {
+          if (this.lessonQuizState !== 'QUESTION_ACTIVE') return;
+          const selectedIdx = Number(button.dataset.idx);
+          const correct = selectedIdx === question.answer;
+          options.querySelectorAll('.quiz-option').forEach(optionButton => {
+            optionButton.disabled = true;
+            optionButton.classList.remove('correct', 'incorrect');
+          });
+          button.classList.add(correct ? 'correct' : 'incorrect');
+          if (!correct && options.children[question.answer]) options.children[question.answer].classList.add('correct');
+          explanation.style.display = 'block';
+          explanation.style.backgroundColor = correct ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)';
+          explanation.style.color = correct ? 'var(--accent-green)' : 'var(--accent-red)';
+          explanation.innerHTML = `<strong>${correct ? 'Correct!' : 'Incorrect'}</strong> ${!correct ? `<br><span>Correct answer: ${question.options[question.answer]}</span><br>` : ''}${question.explanation || ''}`;
+          nextButton.disabled = false;
+          this.lessonQuizState = 'SHOWING_FEEDBACK';
+          this.lessonQuizPassed = correct;
+        });
+      });
+    };
+
+    document.getElementById('lesson-next-question-btn').addEventListener('click', () => {
+      if (this.lessonQuizState !== 'SHOWING_FEEDBACK') return;
+      if (this.lessonQuizIndex >= this.lessonQuizQuestions.length - 1) {
+        this.lessonQuizState = 'QUIZ_COMPLETE';
+        document.getElementById('lesson-next-question-btn').disabled = true;
+        document.getElementById('lesson-next-question-btn').textContent = 'Quiz Complete';
+        return;
+      }
+      this.lessonQuizIndex += 1;
+      renderQuizQuestion();
+    });
+
+    renderQuizQuestion();
+
+    // Populate Right Practice Editor Challenge
+    const challengeData = matchedLesson.practice;
+    document.getElementById("lesson-challenge-prompt").innerHTML = `<p>${challengeData.problem}</p>`;
+    document.getElementById("lesson-code-editor").value = challengeData.starterCode;
+    document.getElementById("lesson-console-output").innerText = "> Ready to verify code challenge...";
+    document.getElementById("lesson-error-suggestion").style.display = "none";
+    window.PyNovaEditor.syncLineNumbers(window.PyNovaEditor.lessonEditor, window.PyNovaEditor.lessonLineNumbers);
+
+    // Reset controls
+    this.lessonQuizPassed = false;
+    this.lessonCodePassed = false;
+
+    // Reset button
+    document.getElementById("lesson-reset-code-btn").onclick = () => {
+      document.getElementById("lesson-code-editor").value = challengeData.starterCode;
+      window.PyNovaEditor.syncLineNumbers(window.PyNovaEditor.lessonEditor, window.PyNovaEditor.lessonLineNumbers);
+    };
+
+    // AI Hint button
+    document.getElementById("lesson-hint-btn").onclick = () => {
+      alert(`💡 Hint: ${window.PyNovaAi.getLessonHint(lessonId)}`);
+    };
+
+    // Lesson Submit complete
+    const submitBtn = document.getElementById("lesson-submit-btn");
+    submitBtn.onclick = () => {
+      if (!this.lessonQuizPassed) {
+        alert("Please complete the Concept Quick Check quiz successfully first!");
+        return;
+      }
+      if (!this.lessonCodePassed) {
+        alert("Please compile and pass the Lesson Challenge validator successfully!");
+        return;
+      }
+
+      // Complete!
+      window.PyNovaState.completeLesson(lessonId, matchedLesson.xpReward);
+      this.switchView("roadmap-view");
+    };
+  }
+
+  checkLessonChallengeCode(detail) {
+    const errorSuggestionBox = document.getElementById("lesson-error-suggestion");
+    const suggestionText = document.getElementById("lesson-error-suggestion-text");
+
+    if (!detail.success) {
+      this.lessonCodePassed = false;
+      errorSuggestionBox.style.display = "block";
+      
+      const help = window.PyNovaAi.generateErrorSolution(detail.code, detail.error);
+      suggestionText.innerHTML = `
+        <strong style="color: var(--accent-red); display: block; margin-bottom: 4px;">Detected: ${help.title}</strong>
+        <p style="margin-bottom: 6px;">${help.why}</p>
+        <p><strong>Corrective template:</strong></p>
+        <pre style="background:#000; padding:6px; font-size:11px; margin-top:4px; border-radius:4px;"><code style="color: #a8ff60">${help.corrected}</code></pre>
+      `;
+      return;
+    }
+
+    // Naive regex check from Database validation rules
+    const pattern = this.activeLesson.practice.expectedPattern;
+    const isMatches = pattern.test(detail.code);
+
+    if (isMatches) {
+      this.lessonCodePassed = true;
+      errorSuggestionBox.style.display = "block";
+      suggestionText.innerHTML = `<span style="color: var(--accent-green);"><i class="fa-solid fa-circle-check"></i> Code logic verified! Click 'Complete Lesson & Unlock Next' above to finalize this node.</span>`;
+    } else {
+      this.lessonCodePassed = false;
+      errorSuggestionBox.style.display = "block";
+      suggestionText.innerHTML = `
+        <strong style="color: var(--accent-gold); display: block; margin-bottom: 4px;">Task Incomplete</strong>
+        <p>Your code compiled without errors, but did not match the expected challenge patterns or values. Review instructions and verify variables outputs.</p>
+      `;
+    }
+  }
+
+  // ----------------------------------------------------
+  // AI TEACHER CHAT ACTIONS
+  // ----------------------------------------------------
+  renderChatSessions() {
+    const list = document.getElementById("chat-sessions-list");
+    if (!list) return;
+
+    list.innerHTML = "";
+    const history = window.PyNovaState.state.chatHistory;
+
+    history.forEach(chat => {
+      const item = document.createElement("div");
+      item.className = `history-item ${chat.id === this.activeChatId ? "active" : ""}`;
+      item.innerText = chat.title;
+      item.addEventListener("click", () => {
+        this.activeChatId = chat.id;
+        this.renderChatMessages();
+        this.renderChatSessions();
+      });
+      list.appendChild(item);
+    });
+  }
+
+  renderChatMessages() {
+    const container = document.getElementById("chat-messages-container");
+    if (!container) return;
+
+    container.innerHTML = "";
+    const chat = window.PyNovaState.state.chatHistory.find(c => c.id === this.activeChatId);
+    if (!chat) return;
+
+    chat.messages.forEach(msg => {
+      const bubble = document.createElement("div");
+      bubble.className = `message-bubble ${msg.sender}`;
+      bubble.innerHTML = `
+        <div>${msg.text}</div>
+        <span class="message-time">${msg.date}</span>
+      `;
+      container.appendChild(bubble);
+    });
+
+    container.scrollTop = container.scrollHeight;
+  }
+
+  sendChatMessage() {
+    const inputBox = document.getElementById("chat-input-box");
+    const text = inputBox.value.trim();
+    if (text === "") return;
+
+    inputBox.value = "";
+
+    // 1. Save user msg
+    window.PyNovaState.addChatMessage(this.activeChatId, "user", text);
+    this.renderChatMessages();
+
+    // 2. Simulate AI response typing
+    this.submitTeacherPrompt(text);
+  }
+
+  submitTeacherPrompt(promptText) {
+    this.activeView = "teacher-view";
+    
+    // Add user message if coming from quick action
+    const chat = window.PyNovaState.state.chatHistory.find(c => c.id === this.activeChatId);
+    const lastMsg = chat ? chat.messages[chat.messages.length - 1] : null;
+    
+    if (!lastMsg || lastMsg.text !== promptText) {
+      window.PyNovaState.addChatMessage(this.activeChatId, "user", promptText);
+      this.renderChatMessages();
+    }
+
+    // Render typing indicator bubble
+    const container = document.getElementById("chat-messages-container");
+    const indicator = document.createElement("div");
+    indicator.className = "message-bubble ai";
+    indicator.innerHTML = `<span style="color:var(--text-muted)"><i class="fa-solid fa-spinner fa-spin"></i> Python AI is typing...</span>`;
+    container.appendChild(indicator);
+    container.scrollTop = container.scrollHeight;
+
+    // Call async modular AI API wrapper
+    window.PyNovaAi.getResponse(promptText, window.PyNovaState.state)
+      .then(response => {
+        // Remove typing bubble
+        if (container.contains(indicator)) {
+          container.removeChild(indicator);
+        }
+
+        window.PyNovaState.addChatMessage(this.activeChatId, "ai", response);
+        this.renderChatMessages();
+        this.renderChatSessions();
+      })
+      .catch(err => {
+        console.error("AI Teacher fetch failed", err);
+        if (container.contains(indicator)) {
+          container.removeChild(indicator);
+        }
+      });
+  }
+
+  // ----------------------------------------------------
+  // SANDBOX EDITOR AI TOOLS
+  // ----------------------------------------------------
+  runSandboxAiTool(tool) {
+    const code = document.getElementById("sandbox-code-editor").value;
+    const container = document.getElementById("editor-ai-explanation-drawer");
+    
+    container.innerHTML = `<span style="color: var(--accent-cyan);"><i class="fa-solid fa-spinner fa-spin"></i> Analyzing workspace code...</span>`;
+
+    setTimeout(() => {
+      let response = "";
+      if (tool === "explain") {
+        response = `
+          <strong style="color:#fff; display:block; margin-bottom:6px;">Walkthrough Analysis:</strong>
+          This script initializes variables and triggers prints. Here is the flow:
+          <ol style="margin-left:14px; margin-top:4px;">
+            <li>Variable assignments set state memory.</li>
+            <li>f-string syntax formatting evaluates inside print.</li>
+          </ol>
+        `;
+      } else if (tool === "debug") {
+        response = `<strong style="color:var(--accent-green); display:block; margin-bottom:6px;">Debug Diagnosis:</strong> No compilation issues found! Output is correct.`;
+      } else if (tool === "optimize") {
+        response = `
+          <strong style="color:var(--accent-violet); display:block; margin-bottom:6px;">Optimizations:</strong>
+          Code complexity: O(1) space, O(1) runtime. Logic is clean.
+        `;
+      } else if (tool === "tests") {
+        response = `
+          <strong style="color:#fff; display:block; margin-bottom:6px;">Generated Unit Tests:</strong>
+          <pre style="background:#000; padding:6px; font-size:11px; margin-top:4px; border-radius:4px;"><code style="color:#a8ff60">def test_sandbox():\n    assert version == 2.0</code></pre>
+        `;
+      }
+
+      container.innerHTML = response;
+    }, 800);
+  }
+
+  // ----------------------------------------------------
+  // PRACTICE ARENA
+  // ----------------------------------------------------
+  renderPracticeArena() {
+    const grid = document.getElementById("arena-challenges-grid");
+    if (!grid) return;
+
+    grid.innerHTML = "";
+
+    const challengePool = [...window.PyNovaDb.CHALLENGES].sort(() => Math.random() - 0.5);
+
+    challengePool.forEach(chal => {
+      const card = document.createElement("div");
+      card.className = "challenge-card";
+      card.innerHTML = `
+        <div class="challenge-meta-row">
+          <span class="chal-diff">${chal.difficulty}</span>
+          <span class="chal-xp">+${chal.xpReward} XP</span>
+        </div>
+        <h3 class="challenge-title">${chal.title}</h3>
+        <p class="challenge-desc">${chal.summary}</p>
+        <button class="btn btn-secondary" style="font-size: 12px; padding: 8px 12px; margin-top: 8px;">Solve Puzzle</button>
+      `;
+      grid.appendChild(card);
+
+      card.querySelector("button").addEventListener("click", () => {
+        this.launchPracticeChallenge(chal);
+      });
+    });
+  }
+
+  launchPracticeChallenge(challenge) {
+    this.activeChallenge = challenge;
+    
+    // We launch it inside the lesson view panels style structure to reuse editor layouts
+    this.switchView("lessons-view");
+
+    const details = document.getElementById("lesson-details-panel");
+    details.innerHTML = `
+      <h2 style="font-size: 24px; color: var(--accent-cyan);"><i class="fa-solid fa-gamepad"></i> Practice: ${challenge.title}</h2>
+      <div style="font-size: 13px; color: var(--accent-green); font-weight: 600; margin-bottom: 12px;">Difficulty Level • +${challenge.xpReward} XP</div>
+      
+      <div class="lesson-explanation">${challenge.description}</div>
+    `;
+
+    // Populate Right Editor with challenge starter code
+    const quizBox = document.getElementById("lesson-quiz-container");
+    quizBox.innerHTML = `
+      <h3 style="font-size: 16px; margin-bottom: 6px;"><i class="fa-solid fa-lightbulb" style="color:var(--accent-gold)"></i> Challenge Instructions</h3>
+      <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.4;">
+        Write a valid code segment according to the criteria. Click 'Run Code' inside the Python Workspace to verify syntax correctness.
+      </p>
+    `;
+
+    document.getElementById("lesson-code-editor").value = challenge.starterCode;
+    document.getElementById("lesson-console-output").innerText = "> Solve challenge and test outputs...";
+    document.getElementById("lesson-error-suggestion").style.display = "none";
+    window.PyNovaEditor.syncLineNumbers(window.PyNovaEditor.lessonEditor, window.PyNovaEditor.lessonLineNumbers);
+
+    this.lessonQuizPassed = true; // Quiz requirement skipped for free practice coding
+    this.lessonCodePassed = false;
+
+    // Override Reset
+    document.getElementById("lesson-reset-code-btn").onclick = () => {
+      document.getElementById("lesson-code-editor").value = challenge.starterCode;
+      window.PyNovaEditor.syncLineNumbers(window.PyNovaEditor.lessonEditor, window.PyNovaEditor.lessonLineNumbers);
+    };
+
+    // Override hint
+    document.getElementById("lesson-hint-btn").onclick = () => {
+      alert("💡 Hint: " + window.PyNovaAi.topics.loops.hint);
+    };
+
+    // Submit Complete
+    document.getElementById("lesson-submit-btn").onclick = () => {
+      if (!this.lessonCodePassed) {
+        alert("Make sure code checks run successfully first!");
+        return;
+      }
+      window.PyNovaState.solveChallenge(challenge.id, challenge.xpReward);
+      this.switchView("practice-view");
+    };
+
+    // Replace code evaluator
+    window.addEventListener("lesson-code-run", (e) => {
+      const errorBox = document.getElementById("lesson-error-suggestion");
+      const errText = document.getElementById("lesson-error-suggestion-text");
+
+      if (!e.detail.success) {
+        this.lessonCodePassed = false;
+        errorBox.style.display = "block";
+        errText.innerText = "Error: " + e.detail.error;
+        return;
+      }
+
+      // Check pattern
+      if (challenge.expectedPattern.test(e.detail.code)) {
+        this.lessonCodePassed = true;
+        errorBox.style.display = "block";
+        errText.innerHTML = `<span style="color: var(--accent-green);"><i class="fa-solid fa-circle-check"></i> Logic correct! Yields FizzBuzz values. Click complete to finish.</span>`;
+      } else {
+        this.lessonCodePassed = false;
+        errorBox.style.display = "block";
+        errText.innerText = "Calculations compiled successfully, but output values mismatch requirements.";
+      }
+    }, { once: true }); // Prevent stacked listeners
+  }
+
+  // ----------------------------------------------------
+  // QUIZ CENTER
+  // ----------------------------------------------------
+  renderQuizList() {
+    const grid = document.getElementById("quiz-list-grid");
+    if (!grid) return;
+
+    grid.innerHTML = "";
+    
+    window.PyNovaDb.QUIZZES.forEach(q => {
+      const card = document.createElement("div");
+      card.className = "challenge-card";
+      
+      const prevScore = window.PyNovaState.state.progress.quizzes[q.id];
+      const statusText = prevScore ? `High Score: ${prevScore.score}/${prevScore.total} 🏆` : "Unattempted";
+      
+      card.innerHTML = `
+        <div class="challenge-meta-row">
+          <span class="chal-diff">${q.difficulty}</span>
+          <span class="chal-xp">+${q.xpReward} XP</span>
+        </div>
+        <h3 class="challenge-title">${q.title}</h3>
+        <p class="challenge-desc">${q.questions.length} questions checkup on control flows.</p>
+        <div style="font-size:12px; font-weight:600; color:var(--text-muted); margin-top:8px;">${statusText}</div>
+        <button class="btn btn-secondary" style="font-size: 12px; padding: 8px 12px; margin-top: 8px;">Start Quiz</button>
+      `;
+      grid.appendChild(card);
+
+      card.querySelector("button").addEventListener("click", () => {
+        this.launchActiveQuiz(q);
+      });
+    });
+  }
+
+  launchActiveQuiz(quiz) {
+    const randomizedQuestions = [...quiz.questions]
+      .map(q => ({ ...q, options: [...q.options] }))
+      .map(q => {
+        const shuffled = [...q.options];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+        let answerIndex = 0;
+        shuffled.forEach((opt, idx) => {
+          if (opt === q.options[q.answer]) answerIndex = idx;
+        });
+        return { ...q, options: shuffled, answer: answerIndex };
+      })
+      .sort(() => Math.random() - 0.5);
+
+    this.activeQuiz = { ...quiz, questions: randomizedQuestions };
+    this.activeQuizIdx = 0;
+    this.activeQuizCorrectCount = 0;
+    
+    const container = document.getElementById("quiz-main-container");
+    container.innerHTML = `
+      <div class="quiz-active-area" style="grid-column: 1 / -1;">
+        <div class="card-header">
+          <h3 class="card-title">${quiz.title}</h3>
+          <span id="quiz-timer">Question 1 of ${quiz.questions.length}</span>
+        </div>
+        <div class="progress-bar-wrapper">
+          <div class="progress-bar-fill" id="quiz-active-progress" style="width: 0%"></div>
+        </div>
+        <div id="quiz-question-box"></div>
+        
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top: 24px;">
+          <button class="btn btn-secondary" id="quiz-hint-btn" style="padding:10px 18px;"><i class="fa-solid fa-lightbulb"></i> Get Hint</button>
+          <button class="btn btn-primary" id="quiz-next-btn" style="padding:12px 24px;">Next Question</button>
+        </div>
+      </div>
+    `;
+
+    document.getElementById("quiz-hint-btn").onclick = () => {
+      const area = document.querySelector(".quiz-active-area");
+      if (!area) return;
+      let hintBox = area.querySelector("#quiz-hint-box");
+      const btn = document.getElementById("quiz-hint-btn");
+      const hintText = "Check standard variable capitalization and logical syntax block structures.";
+      if (!hintBox) {
+        hintBox = document.createElement("div");
+        hintBox.id = "quiz-hint-box";
+        hintBox.style.display = "none";
+        hintBox.innerHTML = `
+          <div class="inline-hint-box" style="margin-top:12px; padding:12px; border-radius:10px; background: linear-gradient(135deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)); border:1px solid rgba(255,255,255,0.04); backdrop-filter: blur(6px);">
+            <div style="font-weight:600; display:flex; gap:8px; align-items:center;">💡 Hint</div>
+            <div style="margin-top:6px; color:var(--text-secondary);">${hintText}</div>
+          </div>
+        `;
+        area.appendChild(hintBox);
+        // animate in
+        requestAnimationFrame(()=>{ hintBox.style.opacity = 0; hintBox.style.transform = 'translateY(-6px)'; hintBox.style.display = 'block';
+          setTimeout(()=>{ hintBox.style.transition='opacity 240ms ease, transform 240ms ease'; hintBox.style.opacity=1; hintBox.style.transform='translateY(0)'; },10);
+        });
+        btn.innerHTML = '<i class="fa-solid fa-lightbulb"></i> Hide Hint';
+      } else {
+        const visible = hintBox.style.display !== 'none';
+        if (visible) {
+          hintBox.style.display = 'none';
+          btn.innerHTML = '<i class="fa-solid fa-lightbulb"></i> Get Hint';
+        } else {
+          hintBox.style.display = 'block';
+          btn.innerHTML = '<i class="fa-solid fa-lightbulb"></i> Hide Hint';
+        }
+      }
+    };
+
+    document.getElementById("quiz-next-btn").onclick = () => this.handleQuizNext();
+
+    this.renderQuizQuestion();
+  }
+
+  renderQuizQuestion() {
+    const qBox = document.getElementById("quiz-question-box");
+    const q = this.activeQuiz.questions[this.activeQuizIdx];
+    
+    const progressFill = document.getElementById("quiz-active-progress");
+    const progressVal = (this.activeQuizIdx / this.activeQuiz.questions.length) * 100;
+    progressFill.style.width = `${progressVal}%`;
+    document.getElementById("quiz-timer").innerText = `Question ${this.activeQuizIdx + 1} of ${this.activeQuiz.questions.length}`;
+
+    const questionMarkup = q.type === 'code' || q.question.includes('\n')
+      ? `<pre style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); border-radius: 12px; padding: 12px; text-align: left; margin-bottom: 16px; overflow-x: auto;"><code>${q.question}</code></pre>`
+      : `<div style="font-weight: 600; font-size:16px; margin-bottom: 16px;">${q.question}</div>`;
+
+    let optionsHtml = "";
+    q.options.forEach((opt, idx) => {
+      const optionMarkup = /^\s*print\(|\n|\s*def |\s*if |\s*for |\s*while |\s*class /.test(opt)
+        ? `<pre style="background: rgba(0,0,0,0.15); border: 1px solid var(--border-color); border-radius: 10px; padding: 8px; margin: 0; text-align:left; overflow-x:auto;"><code>${opt}</code></pre>`
+        : opt;
+      optionsHtml += `<button class="quiz-option" data-idx="${idx}">${optionMarkup}</button>`;
+    });
+
+    qBox.innerHTML = `
+      ${questionMarkup}
+      <div class="quiz-options-list">${optionsHtml}</div>
+      <div id="quiz-feedback-box" style="margin-top:16px; padding:12px; border-radius:12px; display:none; font-size:13px; line-height:1.5;"></div>
+    `;
+
+    this.quizQuestionAnswered = false;
+
+    qBox.querySelectorAll(".quiz-option").forEach(btn => {
+      btn.addEventListener("click", () => {
+        if (this.quizQuestionAnswered) return;
+        this.quizQuestionAnswered = true;
+
+        const idx = parseInt(btn.getAttribute("data-idx"));
+        const feed = document.getElementById("quiz-feedback-box");
+        feed.style.display = "block";
+
+        qBox.querySelectorAll(".quiz-option").forEach(b => b.disabled = true);
+
+        if (idx === q.answer) {
+          btn.classList.add("correct");
+          feed.style.backgroundColor = "rgba(16, 185, 129, 0.08)";
+          feed.style.color = "var(--accent-green)";
+          feed.innerHTML = `<strong>Correct!</strong> ${q.explanation}`;
+          this.activeQuizCorrectCount += 1;
+        } else {
+          btn.classList.add("incorrect");
+          qBox.querySelectorAll(".quiz-option")[q.answer].classList.add("correct");
+          feed.style.backgroundColor = "rgba(239, 68, 68, 0.08)";
+          feed.style.color = "var(--accent-red)";
+          feed.innerHTML = `<strong>Incorrect.</strong> ${q.explanation}`;
+          
+          // Log weak topic recommendations
+          window.PyNovaState.addWeakTopic("logic structures");
+        }
+      });
+    });
+  }
+
+  handleQuizNext() {
+    if (!this.quizQuestionAnswered) {
+      alert("Please choose an answer first!");
+      return;
+    }
+
+    this.activeQuizIdx += 1;
+    if (this.activeQuizIdx < this.activeQuiz.questions.length) {
+      this.renderQuizQuestion();
+    } else {
+      this.finishQuiz();
+    }
+  }
+
+  finishQuiz() {
+    const score = this.activeQuizCorrectCount;
+    const total = this.activeQuiz.questions.length;
+    const accuracy = Math.round((score / total) * 100);
+
+    // Save state
+    window.PyNovaState.completeQuiz(this.activeQuiz.id, score, total, this.activeQuiz.xpReward);
+
+    const container = document.getElementById("quiz-main-container");
+    container.innerHTML = `
+      <div class="quiz-active-area" style="grid-column: 1 / -1; text-align: center; display:flex; flex-direction:column; gap:20px; align-items:center;">
+        <div class="modal-icon" style="font-size: 52px; animation: bounce 2s infinite;">🏆</div>
+        <h2>Quiz Completed!</h2>
+        
+        <div style="display:flex; gap:30px; margin: 10px 0;">
+          <div class="stat-card" style="width: 140px;">
+            <div class="stat-num">${score}/${total}</div>
+            <div class="stat-label">Final Score</div>
+          </div>
+          <div class="stat-card" style="width: 140px;">
+            <div class="stat-num">${accuracy}%</div>
+            <div class="stat-label">Accuracy</div>
+          </div>
+        </div>
+
+        <p style="font-size:14px; color:var(--text-secondary); max-width: 400px; line-height: 1.5;">
+          ${accuracy >= 70 ? "Fantastic! You demonstrated high concept comprehension. New modules unlocked!" : "We recommend reviewing basic logic statements in the teacher panel before retesting."}
+        </p>
+
+        <div style="display:flex; gap:12px;">
+          <button class="btn btn-primary" id="quiz-finish-restart-btn" style="padding: 12px 24px;">Retake Quiz</button>
+          <button class="btn btn-secondary" id="quiz-finish-close-btn" style="padding: 12px 24px;">Back to Quiz Center</button>
+        </div>
+      </div>
+    `;
+
+    document.getElementById("quiz-finish-restart-btn").onclick = () => {
+      if (this.activeQuiz) {
+        this.launchActiveQuiz(this.activeQuiz);
+      }
+    };
+
+    document.getElementById("quiz-finish-close-btn").onclick = () => {
+      // Reload panels
+      this.switchView("quiz-view");
+      this.renderQuizList();
+    };
+  }
+
+  // ----------------------------------------------------
+  // PROJECTS LAB
+  // ----------------------------------------------------
+  renderProjectList() {
+    const grid = document.getElementById("project-list-grid");
+    if (!grid) return;
+
+    grid.innerHTML = "";
+    
+    window.PyNovaDb.PROJECTS.forEach(proj => {
+      const card = document.createElement("div");
+      card.className = "challenge-card";
+      
+      const isCompleted = window.PyNovaState.state.progress.projects[proj.id]?.completed === true;
+      const statusText = isCompleted ? "Completed 🚀" : "Not Started";
+      
+      card.innerHTML = `
+        <div class="challenge-meta-row">
+          <span class="chal-diff">${proj.category} Project</span>
+          <span class="chal-xp">+${proj.xpReward} XP</span>
+        </div>
+        <h3 class="challenge-title">${proj.title}</h3>
+        <p class="challenge-desc">${proj.description}</p>
+        <div style="font-size:12px; font-weight:600; color:var(--text-muted); margin-top:8px;">Status: ${statusText}</div>
+        <button class="btn btn-primary" style="font-size: 12px; padding: 8px 12px; margin-top: 8px;">Build Project</button>
+      `;
+      grid.appendChild(card);
+
+      card.querySelector("button").addEventListener("click", () => {
+        this.launchProjectWorkspace(proj);
+      });
+    });
+  }
+
+  launchProjectWorkspace(project) {
+    this.activeProject = project;
+    
+    // Hide list grid
+    document.getElementById("project-list-grid").style.display = "none";
+    
+    const ws = document.getElementById("project-workspace");
+    ws.style.display = "grid";
+
+    // Setup headers
+    document.getElementById("project-workspace-title").innerText = project.title;
+    document.getElementById("project-workspace-desc").innerText = project.description;
+    document.getElementById("project-code-editor").value = project.starterCode;
+    document.getElementById("project-console-output").innerText = "> Workspace initialized.";
+    window.PyNovaEditor.syncLineNumbers(window.PyNovaEditor.projectEditor, window.PyNovaEditor.projectLineNumbers);
+
+    // Load tasks list checklist
+    const list = document.getElementById("project-workspace-tasks");
+    list.innerHTML = "";
+    
+    // Fetch state or create defaults
+    let projState = window.PyNovaState.state.progress.projects[project.id];
+    if (!projState) {
+      projState = { tasks: {}, completed: false };
+      window.PyNovaState.state.progress.projects[project.id] = projState;
+    }
+
+    project.tasks.forEach(task => {
+      const completed = projState.tasks[task.id] === true;
+      
+      const row = document.createElement("div");
+      row.className = `task-item-row ${completed ? "completed" : ""}`;
+      row.innerHTML = `
+        <div class="task-checkbox">${completed ? '<i class="fa-solid fa-check"></i>' : ''}</div>
+        <span>${task.text}</span>
+      `;
+      
+      row.addEventListener("click", () => {
+        const currentlyDone = !row.classList.contains("completed");
+        row.classList.toggle("completed", currentlyDone);
+        row.querySelector(".task-checkbox").innerHTML = currentlyDone ? '<i class="fa-solid fa-check"></i>' : '';
+        
+        window.PyNovaState.completeProjectTask(project.id, task.id, currentlyDone);
+        
+        // Notify Project Mentor on checklist action
+        this.notifyMentorOnTaskAction(task, currentlyDone);
+      });
+
+      list.appendChild(row);
+    });
+  }
+
+  notifyMentorOnTaskAction(task, status) {
+    const msgBox = document.getElementById("project-mentor-messages");
+    if (!msgBox) return;
+
+    if (status) {
+      // Typing mock response
+      const bubble = document.createElement("div");
+      bubble.className = "message-bubble ai";
+      bubble.innerHTML = `<span style="color:var(--text-muted)"><i class="fa-solid fa-spinner fa-spin"></i> Mentor is reviewing...</span>`;
+      msgBox.appendChild(bubble);
+      msgBox.scrollTop = msgBox.scrollHeight;
+
+      setTimeout(() => {
+        msgBox.removeChild(bubble);
+        
+        const code = document.getElementById("project-code-editor").value;
+        const feedback = window.PyNovaAi.getProjectMentorResponse(this.activeProject.id, task.text, code);
+        
+        const newBubble = document.createElement("div");
+        newBubble.className = "message-bubble ai";
+        newBubble.innerHTML = feedback;
+        msgBox.appendChild(newBubble);
+        msgBox.scrollTop = msgBox.scrollHeight;
+      }, 1000);
+    }
+  }
+
+  sendProjectMentorMessage() {
+    const input = document.getElementById("project-mentor-input");
+    const text = input.value.trim();
+    if (text === "") return;
+
+    input.value = "";
+    
+    const msgBox = document.getElementById("project-mentor-messages");
+    const userBubble = document.createElement("div");
+    userBubble.className = "message-bubble user";
+    userBubble.innerHTML = `<div>${text}</div>`;
+    msgBox.appendChild(userBubble);
+    msgBox.scrollTop = msgBox.scrollHeight;
+
+    const loader = document.createElement("div");
+    loader.className = "message-bubble ai";
+    loader.innerHTML = `<span><i class="fa-solid fa-spinner fa-spin"></i> Mentor is typing...</span>`;
+    msgBox.appendChild(loader);
+    msgBox.scrollTop = msgBox.scrollHeight;
+
+    setTimeout(() => {
+      msgBox.removeChild(loader);
+      
+      const mentorText = `Awesome question! When compiling "${this.activeProject.title}", remember that logic loops should wrap instructions correctly. Try printing variables to see their value flow! Let me know if you need code structure details.`;
+      
+      const newBubble = document.createElement("div");
+      newBubble.className = "message-bubble ai";
+      newBubble.innerHTML = `<div>${mentorText}</div>`;
+      msgBox.appendChild(newBubble);
+      msgBox.scrollTop = msgBox.scrollHeight;
+    }, 1000);
+  }
+
+  checkProjectChallengeCode(detail) {
+    if (detail.success) {
+      // Code ran without issues
+      this.projectCodeCompiles = true;
+    } else {
+      this.projectCodeCompiles = false;
+    }
+  }
+
+  submitProject() {
+    const state = window.PyNovaState.state.progress.projects[this.activeProject.id];
+    
+    // Ensure all tasks are completed
+    let allDone = true;
+    this.activeProject.tasks.forEach(t => {
+      if (state.tasks[t.id] !== true) allDone = false;
+    });
+
+    if (!allDone) {
+      alert("Please complete all project task checklist items first!");
+      return;
+    }
+
+    const code = document.getElementById("project-code-editor").value;
+    
+    // Naive verification rules checking
+    const compiles = this.projectCodeCompiles || false;
+    const matchesPattern = this.activeProject.expectedPattern.test(code);
+
+    if (compiles && matchesPattern) {
+      // Save state
+      window.PyNovaState.completeProject(this.activeProject.id, this.activeProject.xpReward);
+      
+      // Close project workspace
+      document.getElementById("project-workspace").style.display = "none";
+      document.getElementById("project-list-grid").style.display = "grid";
+      
+      this.renderProjectList();
+    } else {
+      alert("Your project code failed verification checks. Ensure it imports libraries correctly and executes operations successfully.");
+    }
+  }
+
+  // ----------------------------------------------------
+  // LEADERBOARD
+  // ----------------------------------------------------
+  async renderLeaderboard() {
+    const rows = document.getElementById("leaderboard-table-rows");
+    if (!rows) return;
+
+    rows.innerHTML = "";
+    const emptyState = document.getElementById('leaderboard-empty-state');
+    const totalUsers = document.getElementById('leaderboard-total-users');
+    const yourRank = document.getElementById('leaderboard-your-rank');
+    const client = window.PyNovaSupabase;
+
+    if (!client || !client._isConfigured) {
+      if (emptyState) {
+        emptyState.textContent = 'Leaderboard data is unavailable until Supabase is configured.';
+        emptyState.classList.remove('hidden');
+      }
+      if (totalUsers) totalUsers.textContent = '0';
+      if (yourRank) yourRank.textContent = 'Your Rank: —';
+      return;
+    }
+
+    const { data, error } = await client
+      .from('leaderboard_profiles')
+      .select('user_id, username, avatar, xp, level, streak')
+      .order('xp', { ascending: false })
+      .order('username', { ascending: true });
+
+    if (error) {
+      console.warn('Unable to load leaderboard', error);
+      if (emptyState) {
+        emptyState.textContent = 'Unable to load the leaderboard right now.';
+        emptyState.classList.remove('hidden');
+      }
+      return;
+    }
+
+    const profiles = Array.isArray(data) ? data : [];
+    const currentUserId = window.PyNovaAuth?.currentUser?.id || window.PyNovaState.state.profile.userId;
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+    }[character]));
+    const getProgress = profile => {
+      const level = Math.max(1, Number(profile.level) || 1);
+      const xp = Math.max(0, Number(profile.xp) || 0);
+      const currentLevelXp = (level - 1) * (level - 1) * 100;
+      const nextLevelXp = level * level * 100;
+      return Math.round(Math.min(100, Math.max(0, ((xp - currentLevelXp) / (nextLevelXp - currentLevelXp)) * 100)));
+    };
+
+    if (totalUsers) totalUsers.textContent = String(profiles.length);
+    if (emptyState) emptyState.classList.toggle('hidden', profiles.length > 0);
+
+    let currentRank = null;
+    profiles.forEach((profile, index) => {
+      const rank = index + 1;
+      const level = Math.max(1, Number(profile.level) || 1);
+      const xp = Math.max(0, Number(profile.xp) || 0);
+      const progress = getProgress(profile);
+      const isCurrentUser = profile.user_id === currentUserId;
+      if (isCurrentUser) currentRank = rank;
+      const rankClass = rank <= 3 ? `top-${['one', 'two', 'three'][rank - 1]}` : '';
+      const tr = document.createElement("tr");
+      tr.className = `leaderboard-row${isCurrentUser ? ' current-user' : ''}`;
+
+      tr.innerHTML = `
+        <td class="leaderboard-cell rank"><span class="leaderboard-rank-badge ${rankClass}">${rank}</span></td>
+        <td class="leaderboard-cell user">
+          <div class="avatar-circle leaderboard-avatar">${escapeHtml(profile.avatar || '🤖')}</div>
+          <span>${escapeHtml(profile.username || 'User')}${isCurrentUser ? ' (You)' : ''}</span>
+        </td>
+        <td class="leaderboard-cell level">Lvl ${level}</td>
+        <td class="leaderboard-cell progress">
+          <div class="leaderboard-progress"><span>${progress}%</span><span class="leaderboard-progress-track"><span class="leaderboard-progress-fill" style="width:${progress}%"></span></span></div>
+        </td>
+        <td class="leaderboard-cell xp">${xp} XP</td>
+        <td class="leaderboard-cell streak">${Math.max(1, Number(profile.streak) || 1)} days</td>
+      `;
+      rows.appendChild(tr);
+    });
+
+    if (yourRank) yourRank.textContent = currentRank ? `Your Rank: #${currentRank}` : 'Your Rank: —';
+  }
+
+  setupLeaderboardRealtime() {
+    const client = window.PyNovaSupabase;
+    if (this.leaderboardChannel || !client || !client._isConfigured || typeof client.channel !== 'function') return;
+
+    this.leaderboardChannel = client
+      .channel('pynova-leaderboard')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, () => this.renderLeaderboard())
+      .subscribe();
+  }
+
+  teardownLeaderboardRealtime() {
+    const client = window.PyNovaSupabase;
+    if (this.leaderboardChannel && client && typeof client.removeChannel === 'function') {
+      client.removeChannel(this.leaderboardChannel);
+    }
+    this.leaderboardChannel = null;
+  }
+
+  // ----------------------------------------------------
+  // PROFILE & GAME MECHANICS
+  // ----------------------------------------------------
+  renderProfile() {
+    const profile = window.PyNovaState.state.profile;
+    const stats = profile.stats;
+
+    document.getElementById("profile-username-large").innerText = profile.username;
+    document.getElementById("profile-level-badge").innerText = `Level ${profile.level} Pythonist`;
+    document.getElementById("profile-avatar-large").innerText = profile.avatar;
+
+    // stats
+    document.getElementById("profile-stat-lessons").innerText = stats.lessonsCompleted;
+    document.getElementById("profile-stat-challenges").innerText = stats.challengesSolved;
+    document.getElementById("profile-stat-projects").innerText = stats.projectsCompleted;
+
+    // Badges grid mapping
+    const badgesBox = document.getElementById("profile-badges-container");
+    badgesBox.innerHTML = "";
+
+    window.PyNovaDb.BADGES.forEach(badge => {
+      const owned = profile.badges.includes(badge.id);
+      const div = document.createElement("div");
+      div.className = `badge-item ${owned ? "unlocked" : ""}`;
+      div.innerHTML = `
+        <div class="badge-icon">${badge.icon}</div>
+        <div class="badge-title">${badge.title}</div>
+        <div class="badge-desc">${badge.desc}</div>
+      `;
+      badgesBox.appendChild(div);
+    });
+  }
+
+  changeUserAvatar() {
+    const avatars = ["🤖", "🐍", "🚀", "🧠", "🔥", "🐱", "🐶", "👾"];
+    const current = window.PyNovaState.state.profile.avatar;
+    let nextIdx = (avatars.indexOf(current) + 1) % avatars.length;
+    
+    window.PyNovaState.state.profile.avatar = avatars[nextIdx];
+    window.PyNovaState.save();
+    
+    this.renderProfile();
+    this.loadStateAndStats();
+  }
+
+  // ----------------------------------------------------
+  // MODALS LAUNCHERS
+  // ----------------------------------------------------
+  triggerLevelUpModal(lvl) {
+    const modal = document.getElementById("levelup-modal");
+    modal.classList.add("active");
+    document.getElementById("levelup-level-title").innerText = `You reached Level ${lvl}`;
+
+    document.getElementById("levelup-close-btn").onclick = () => {
+      modal.classList.remove("active");
+    };
+  }
+
+  triggerBadgeModal(badgeId) {
+    const modal = document.getElementById("badge-modal");
+    const info = window.PyNovaDb.BADGES.find(b => b.id === badgeId);
+    if (!info) return;
+
+    modal.classList.add("active");
+    document.getElementById("badge-earned-icon").innerText = info.icon;
+    document.getElementById("badge-earned-title").innerText = info.title;
+    document.getElementById("badge-earned-desc").innerText = info.desc;
+
+    document.getElementById("badge-close-btn").onclick = () => {
+      modal.classList.remove("active");
+    };
+  }
+
+  resetAppState() {
+    if (confirm("Are you sure you want to reset all progress, XP, badges, and learning history? This cannot be undone.")) {
+      window.PyNovaState.reset();
+      this.loadStateAndStats();
+      this.switchView("dashboard-view");
+      
+      // Refresh views
+      this.init();
+      alert("App state has been reset successfully.");
+    }
+  }
+
+  // Utilities
+  formatId(id) {
+    return id.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+  }
+}
+
+// Global Launcher
+window.addEventListener("DOMContentLoaded", () => {
+  window.PyNovaApp = new AppController();
+});
